@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+*.log
+
+vigi_event_web/data/
+vigi_event_web/uploads/
+vigi_event_web/snapshot_test.bin
