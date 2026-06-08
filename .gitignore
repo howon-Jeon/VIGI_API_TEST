@@ -4,4 +4,7 @@ __pycache__/
 
 vigi_event_web/data/
 vigi_event_web/uploads/
+vigi_event_web/config.json
 vigi_event_web/snapshot_test.bin
+vigi_event_web/snapshot_test_*.jpg
+vigi_event_web/probe_*.bin

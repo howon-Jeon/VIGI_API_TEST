@@ -4,10 +4,18 @@ from urllib.parse import parse_qs, urlparse
 import base64
 import json
 import mimetypes
+import os
 import re
+import shutil
 import sqlite3
+import ssl
+import subprocess
+import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
+from urllib.parse import quote
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -15,8 +23,11 @@ DATA_DIR = BASE_DIR / "data"
 UPLOAD_DIR = BASE_DIR / "uploads" / "events"
 RAW_DIR = BASE_DIR / "uploads" / "raw"
 DB_PATH = DATA_DIR / "events.sqlite3"
+CONFIG_PATH = BASE_DIR / "config.json"
 HOST = "0.0.0.0"
 PORT = 8080
+DEFAULT_CAMERA_IP = "192.168.10.162"
+DEFAULT_SNAPSHOT_DELAY_SECONDS = 3
 
 
 def ensure_dirs():
@@ -50,6 +61,34 @@ def init_db():
             )
             """
         )
+
+
+def load_config():
+    config = {
+        "camera_ip": DEFAULT_CAMERA_IP,
+        "snapshot_delay_seconds": DEFAULT_SNAPSHOT_DELAY_SECONDS,
+        "snapshot_urls": [
+            "https://{ip}:8443/snapshot",
+            "http://{ip}:8800/snapshot",
+        ],
+        "rtsp_fallback_enabled": True,
+        "rtsp_urls": [
+            "rtsp://{username}:{password}@{ip}:554/stream1",
+            "rtsp://{username}:{password}@{ip}:554/stream2",
+        ],
+        "ffmpeg_path": os.environ.get("FFMPEG_PATH", "ffmpeg"),
+        "camera_username": os.environ.get("VIGI_CAMERA_USERNAME", "admin"),
+        "camera_password": os.environ.get("VIGI_CAMERA_PASSWORD", ""),
+        "verify_ssl": False,
+    }
+    if CONFIG_PATH.exists():
+        try:
+            file_config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(file_config, dict):
+                config.update({key: value for key, value in file_config.items() if value is not None})
+        except json.JSONDecodeError:
+            print(f"Invalid JSON config: {CONFIG_PATH}")
+    return config
 
 
 def now_text():
@@ -142,6 +181,15 @@ def row_to_dict(row):
         item["image_url"] = "/" + item["image_path"].replace("\\", "/")
     else:
         item["image_url"] = ""
+    item["snapshot_status"] = {}
+    if item.get("raw_payload"):
+        try:
+            payload = json.loads(item["raw_payload"])
+            snapshot_status = payload.get("_snapshot_status")
+            if isinstance(snapshot_status, dict):
+                item["snapshot_status"] = snapshot_status
+        except json.JSONDecodeError:
+            pass
     return item
 
 
@@ -158,6 +206,65 @@ def latest_event():
     with db() as conn:
         row = conn.execute("select * from events order by id desc limit 1").fetchone()
     return row_to_dict(row) if row else None
+
+
+def update_event_snapshot(event_id, image_path, status, error=""):
+    with db() as conn:
+        row = conn.execute(
+            "select image_path, raw_payload from events where id = ?",
+            (event_id,),
+        ).fetchone()
+        if not row:
+            return False
+
+        previous_image_path = row["image_path"]
+        try:
+            payload = json.loads(row["raw_payload"] or "{}")
+        except json.JSONDecodeError:
+            payload = {"raw_payload": row["raw_payload"] or ""}
+
+        payload["_snapshot_status"] = {
+            "status": status,
+            "delay_seconds": load_config().get("snapshot_delay_seconds", DEFAULT_SNAPSHOT_DELAY_SECONDS),
+            "updated_at": now_text(),
+        }
+        if error:
+            payload["_snapshot_status"]["error"] = str(error)
+
+        conn.execute(
+            "update events set image_path = ?, raw_payload = ? where id = ?",
+            (image_path, json.dumps(payload, ensure_ascii=False, indent=2), event_id),
+        )
+
+    if previous_image_path and previous_image_path != image_path:
+        remove_relative_file(previous_image_path)
+    return True
+
+
+def update_event_snapshot_status(event_id, status, error=""):
+    with db() as conn:
+        row = conn.execute("select raw_payload from events where id = ?", (event_id,)).fetchone()
+        if not row:
+            return False
+
+        try:
+            payload = json.loads(row["raw_payload"] or "{}")
+        except json.JSONDecodeError:
+            payload = {"raw_payload": row["raw_payload"] or ""}
+
+        snapshot_status = payload.get("_snapshot_status")
+        if not isinstance(snapshot_status, dict):
+            snapshot_status = {}
+        snapshot_status.update({"status": status, "updated_at": now_text()})
+        if error:
+            snapshot_status["error"] = str(error)
+        payload["_snapshot_status"] = snapshot_status
+
+        conn.execute(
+            "update events set raw_payload = ? where id = ?",
+            (json.dumps(payload, ensure_ascii=False, indent=2), event_id),
+        )
+    return True
 
 
 def remove_relative_file(relative_path):
@@ -194,6 +301,194 @@ def clear_events():
         remove_relative_file(row["image_path"])
         remove_relative_file(row["raw_path"])
     return len(rows)
+
+
+def snapshot_urls(camera_ip):
+    config = load_config()
+    configured = config.get("snapshot_urls", [])
+    if isinstance(configured, str):
+        configured = [configured]
+    urls = []
+    for template in configured:
+        url = str(template).strip()
+        if url:
+            urls.append(url.format(ip=camera_ip))
+    return urls
+
+
+def rtsp_urls(camera_ip):
+    config = load_config()
+    configured = config.get("rtsp_urls", [])
+    if isinstance(configured, str):
+        configured = [configured]
+
+    username = quote(str(config.get("camera_username") or ""), safe="")
+    password = quote(str(config.get("camera_password") or ""), safe="")
+    urls = []
+    for template in configured:
+        url = str(template).strip()
+        if url:
+            urls.append(url.format(ip=camera_ip, username=username, password=password))
+    return urls
+
+
+def redact_url(value):
+    return re.sub(r"(rtsp://[^:/@]+:)[^@]+@", r"\1***@", str(value))
+
+
+def camera_ip_from_payload(payload, fallback_ip):
+    if isinstance(payload, dict):
+        event = payload.get("event")
+        if isinstance(event, dict) and event.get("ip"):
+            return str(event["ip"])
+        for key in ("ip", "camera_ip", "device_ip", "host"):
+            if payload.get(key):
+                return str(payload[key])
+    config_ip = str(load_config().get("camera_ip") or "").strip()
+    return config_ip or fallback_ip
+
+
+def fetch_snapshot(url):
+    config = load_config()
+    username = str(config.get("camera_username") or "")
+    password = str(config.get("camera_password") or "")
+    verify_ssl = bool(config.get("verify_ssl", False))
+    context = None if verify_ssl else ssl._create_unverified_context()
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "image/jpeg,*/*",
+            "Cache-Control": "no-cache",
+            "User-Agent": "VIGI-Event-Receiver/1.0",
+        },
+    )
+
+    if username and password:
+        password_mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+        password_mgr.add_password(None, url, username, password)
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPDigestAuthHandler(password_mgr),
+            urllib.request.HTTPSHandler(context=context),
+        )
+        response = opener.open(request, timeout=8)
+    else:
+        response = urllib.request.urlopen(request, timeout=8, context=context)
+
+    with response:
+        content_type = response.headers.get("Content-Type", "")
+        data = response.read()
+
+    if not data.startswith(b"\xff\xd8") and "image/jpeg" not in content_type.lower():
+        raise ValueError(f"Snapshot response is not JPEG: {content_type}")
+    return data
+
+
+def find_ffmpeg():
+    config = load_config()
+    configured = str(config.get("ffmpeg_path") or "ffmpeg").strip()
+    if Path(configured).exists():
+        return configured
+    found = shutil.which(configured)
+    if found:
+        return found
+    return ""
+
+
+def capture_rtsp_frame(url, output_path):
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is not installed or ffmpeg_path is not configured.")
+
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-rtsp_transport",
+        "tcp",
+        "-i",
+        url,
+        "-frames:v",
+        "1",
+        "-q:v",
+        "2",
+        "-y",
+        str(output_path),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=15)
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "ffmpeg failed").strip())
+    data = output_path.read_bytes()
+    if not data.startswith(b"\xff\xd8"):
+        raise RuntimeError("ffmpeg output is not JPEG.")
+    return data
+
+
+def save_rtsp_fallback_snapshot(event_id, camera_ip):
+    config = load_config()
+    if not config.get("rtsp_fallback_enabled", True):
+        return False, "RTSP fallback is disabled."
+
+    errors = []
+    for url in rtsp_urls(camera_ip):
+        filename = f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}_rtsp.jpg"
+        path = UPLOAD_DIR / filename
+        try:
+            capture_rtsp_frame(url, path)
+            image_path = str(path.relative_to(BASE_DIR))
+            if not update_event_snapshot(event_id, image_path, "saved_rtsp"):
+                remove_relative_file(image_path)
+            print(f"RTSP fallback snapshot saved for event {event_id}: {url}")
+            return True, ""
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+            remove_relative_file(str(path.relative_to(BASE_DIR)))
+            errors.append(f"{redact_url(url)} - {error}")
+    return False, " | ".join(errors) if errors else "RTSP fallback failed."
+
+
+def save_delayed_snapshot(event_id, payload, remote_addr):
+    config = load_config()
+    delay_seconds = float(config.get("snapshot_delay_seconds") or DEFAULT_SNAPSHOT_DELAY_SECONDS)
+    time.sleep(delay_seconds)
+
+    camera_ip = camera_ip_from_payload(payload, remote_addr)
+    errors = []
+    update_event_snapshot_status(event_id, "fetching")
+
+    for url in snapshot_urls(camera_ip):
+        try:
+            data = fetch_snapshot(url)
+            filename = f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}_snapshot.jpg"
+            path = UPLOAD_DIR / filename
+            path.write_bytes(data)
+            image_path = str(path.relative_to(BASE_DIR))
+            if not update_event_snapshot(event_id, image_path, "saved"):
+                remove_relative_file(image_path)
+            print(f"Delayed URL snapshot saved for event {event_id}: {url}")
+            return
+        except (OSError, ValueError, urllib.error.URLError) as error:
+            errors.append(f"{redact_url(url)} - {error}")
+
+    update_event_snapshot_status(event_id, "fetching_rtsp")
+    rtsp_ok, rtsp_error = save_rtsp_fallback_snapshot(event_id, camera_ip)
+    if rtsp_ok:
+        return
+
+    if rtsp_error:
+        errors.append(rtsp_error)
+    error_message = " | ".join(errors) if errors else "Snapshot failed"
+    update_event_snapshot_status(event_id, "failed", error_message)
+    print(f"Delayed URL snapshot failed for event {event_id}: {error_message}")
+
+
+def schedule_delayed_snapshot(event_id, payload, remote_addr):
+    thread = threading.Thread(
+        target=save_delayed_snapshot,
+        args=(event_id, payload, remote_addr),
+        daemon=True,
+    )
+    thread.start()
 
 
 def parse_multipart(body, content_type):
@@ -677,6 +972,20 @@ function eventTitle(item) {
   return `${channel} · ${type}`;
 }
 
+function snapshotMessage(item) {
+  const status = item.snapshot_status || {};
+  if (status.status === "failed") {
+    return `3초 후 캡처 실패: ${status.error || "URL Snapshot/RTSP 설정과 ffmpeg 설치를 확인하세요."}`;
+  }
+  if (status.status === "fetching_rtsp") {
+    return "URL Snapshot이 실패해서 RTSP 프레임 캡처를 시도하는 중입니다.";
+  }
+  if (status.status === "fetching") {
+    return "3초가 지나 URL Snapshot을 가져오는 중입니다.";
+  }
+  return "사람 감지 이벤트를 받았습니다. 3초 후 카메라 URL Snapshot을 가져옵니다.";
+}
+
 function renderLatest(item) {
   if (!item) {
     latestMeta.textContent = "아직 수신된 이벤트가 없습니다.";
@@ -688,7 +997,7 @@ function renderLatest(item) {
   if (item.image_url) {
     imageStage.innerHTML = `<img src="${cacheBust(item.image_url)}" alt="최신 사람 감지 캡처">`;
   } else {
-    imageStage.innerHTML = '<div class="empty">사람 감지 이벤트는 받았지만 첨부 이미지가 없습니다. Alarm Server의 Attach Image 값을 확인하세요.</div>';
+    imageStage.innerHTML = `<div class="empty">${snapshotMessage(item)}</div>`;
   }
 }
 
@@ -701,7 +1010,7 @@ function renderEvents(items) {
   eventList.innerHTML = items.map((item) => {
     const image = item.image_url
       ? `<img src="${cacheBust(item.image_url)}" alt="감지 캡처">`
-      : '<div class="no-image">이미지 없음</div>';
+      : `<div class="no-image">${snapshotMessage(item)}</div>`;
     return `
       <article class="event-card">
         ${image}
@@ -853,15 +1162,30 @@ class Handler(BaseHTTPRequestHandler):
         raw_path.write_bytes(body)
 
         payload, image_path = parse_payload(body, content_type)
-        camera_channel, event_type = guess_event_fields(payload)
-        event_type = filter_event_type(event_type)
+        camera_channel, raw_event_type = guess_event_fields(payload)
+        event_type = filter_event_type(raw_event_type)
         if not event_type:
             remove_relative_file(image_path)
             remove_relative_file(str(raw_path.relative_to(BASE_DIR)))
+            print(
+                f"Ignored non-human event from {self.client_address[0]}: "
+                f"raw_event_type={raw_event_type!r}"
+            )
             self.send_json({"ok": True, "ignored": True, "reason": "not a human detection event"})
             return
 
         event_time = str(payload.get("event_time") or payload.get("time") or payload.get("timestamp") or now_text())
+        if image_path:
+            remove_relative_file(image_path)
+            image_path = ""
+        remove_relative_file(str(raw_path.relative_to(BASE_DIR)))
+        raw_path_for_db = ""
+        payload["_snapshot_status"] = {
+            "status": "waiting",
+            "delay_seconds": load_config().get("snapshot_delay_seconds", DEFAULT_SNAPSHOT_DELAY_SECONDS),
+            "started_at": now_text(),
+            "note": "NVR attached image and raw body were discarded. Waiting for URL Snapshot.",
+        }
 
         raw_payload = json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -870,19 +1194,22 @@ class Handler(BaseHTTPRequestHandler):
             camera_channel=camera_channel,
             event_type=event_type,
             image_path=image_path,
-            raw_path=str(raw_path.relative_to(BASE_DIR)),
+            raw_path=raw_path_for_db,
             raw_payload=raw_payload,
             content_type=content_type,
             remote_addr=self.client_address[0],
         )
 
+        schedule_delayed_snapshot(event_id, payload, self.client_address[0])
+
         self.send_json(
             {
                 "ok": True,
                 "id": event_id,
-                "image_saved": bool(image_path),
+                "image_saved": False,
+                "snapshot_scheduled": True,
                 "image_path": image_path,
-                "raw_saved": str(raw_path.relative_to(BASE_DIR)),
+                "raw_saved": raw_path_for_db,
             }
         )
 
