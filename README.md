@@ -11,7 +11,8 @@ VIGI 카메라 사람 감지
 → 3초 대기
 → RTSP stream1/stream2에 접속
 → 현재 영상 프레임 1장을 JPEG로 캡처
-→ 웹에서 최신 이미지와 최근 이벤트 표시
+→ 같은 RTSP stream에서 5초 MP4 클립 저장
+→ 웹에서 최신 이미지와 영상을 함께 표시
 ```
 
 ## 왜 RTSP 프레임 캡처인가?
@@ -260,6 +261,7 @@ MOTION+PEOPLE → PEOPLE로 처리
 {
   "camera_ip": "192.168.10.162",
   "snapshot_delay_seconds": 3,
+  "clip_seconds": 5,
   "rtsp_urls": [
     "rtsp://{username}:{password}@{ip}:554/stream1",
     "rtsp://{username}:{password}@{ip}:554/stream2"
@@ -271,6 +273,7 @@ MOTION+PEOPLE → PEOPLE로 처리
 ```
 
 `snapshot_delay_seconds`는 이름은 남아 있지만 의미는 “이벤트 후 RTSP 캡처 대기 시간”입니다.
+`clip_seconds`는 저장할 영상 길이입니다.
 
 ## 제공 API
 
@@ -319,10 +322,10 @@ GET /uploads/events/파일명.jpg
 4. NVR 첨부 이미지와 raw body 삭제
 5. DB에 waiting 상태 저장
 6. 별도 thread에서 3초 대기
-7. ffmpeg로 RTSP stream1 캡처 시도
-8. 실패하면 stream2 캡처 시도
-9. JPEG 저장 후 DB image_path 갱신
-10. 웹 UI가 5초 polling으로 최신 이미지 표시
+7. ffmpeg로 RTSP stream1 이미지/영상 캡처 시도
+8. 실패하면 stream2 이미지/영상 캡처 시도
+9. JPEG와 MP4 저장 후 DB image_path/video_path 갱신
+10. 웹 UI가 10초 polling으로 최신 이미지와 영상 표시
 ```
 
 ## 로그 해석
@@ -339,10 +342,10 @@ GET /uploads/events/파일명.jpg
 127.0.0.1 - "GET /api/events?limit=24 HTTP/1.1" 200 -
 ```
 
-RTSP 캡처 성공:
+RTSP 이미지/영상 캡처 성공:
 
 ```text
-RTSP frame capture saved for event 51: rtsp://admin:***@192.168.10.162:554/stream1
+RTSP media capture saved for event 51: rtsp://admin:***@192.168.10.162:554/stream1
 ```
 
 ffmpeg 미설치:

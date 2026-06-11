@@ -25,6 +25,7 @@ HOST = "0.0.0.0"
 PORT = 8080
 DEFAULT_CAMERA_IP = "192.168.10.162"
 DEFAULT_SNAPSHOT_DELAY_SECONDS = 3
+DEFAULT_CLIP_SECONDS = 5
 
 
 def ensure_dirs():
@@ -50,6 +51,7 @@ def init_db():
                 camera_channel text,
                 event_type text,
                 image_path text,
+                video_path text,
                 raw_path text,
                 raw_payload text,
                 content_type text,
@@ -58,12 +60,16 @@ def init_db():
             )
             """
         )
+        columns = {row["name"] for row in conn.execute("pragma table_info(events)").fetchall()}
+        if "video_path" not in columns:
+            conn.execute("alter table events add column video_path text")
 
 
 def load_config():
     config = {
         "camera_ip": DEFAULT_CAMERA_IP,
         "snapshot_delay_seconds": DEFAULT_SNAPSHOT_DELAY_SECONDS,
+        "clip_seconds": DEFAULT_CLIP_SECONDS,
         "rtsp_urls": [
             "rtsp://{username}:{password}@{ip}:554/stream1",
             "rtsp://{username}:{password}@{ip}:554/stream2",
@@ -141,21 +147,22 @@ def filter_event_type(event_type):
     return "+".join(dict.fromkeys(allowed))
 
 
-def insert_event(event_time, camera_channel, event_type, image_path, raw_path, raw_payload, content_type, remote_addr):
+def insert_event(event_time, camera_channel, event_type, image_path, video_path, raw_path, raw_payload, content_type, remote_addr):
     with db() as conn:
         cur = conn.execute(
             """
             insert into events (
-                event_time, camera_channel, event_type, image_path, raw_path,
+                event_time, camera_channel, event_type, image_path, video_path, raw_path,
                 raw_payload, content_type, remote_addr, created_at
             )
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event_time,
                 camera_channel,
                 event_type,
                 image_path,
+                video_path,
                 raw_path,
                 raw_payload,
                 content_type,
@@ -172,6 +179,10 @@ def row_to_dict(row):
         item["image_url"] = "/" + item["image_path"].replace("\\", "/")
     else:
         item["image_url"] = ""
+    if item.get("video_path"):
+        item["video_url"] = "/" + item["video_path"].replace("\\", "/")
+    else:
+        item["video_url"] = ""
     item["snapshot_status"] = {}
     if item.get("raw_payload"):
         try:
@@ -199,16 +210,17 @@ def latest_event():
     return row_to_dict(row) if row else None
 
 
-def update_event_snapshot(event_id, image_path, status, error=""):
+def update_event_media(event_id, image_path, video_path, status, error=""):
     with db() as conn:
         row = conn.execute(
-            "select image_path, raw_payload from events where id = ?",
+            "select image_path, video_path, raw_payload from events where id = ?",
             (event_id,),
         ).fetchone()
         if not row:
             return False
 
         previous_image_path = row["image_path"]
+        previous_video_path = row["video_path"]
         try:
             payload = json.loads(row["raw_payload"] or "{}")
         except json.JSONDecodeError:
@@ -223,12 +235,14 @@ def update_event_snapshot(event_id, image_path, status, error=""):
             payload["_snapshot_status"]["error"] = str(error)
 
         conn.execute(
-            "update events set image_path = ?, raw_payload = ? where id = ?",
-            (image_path, json.dumps(payload, ensure_ascii=False, indent=2), event_id),
+            "update events set image_path = ?, video_path = ?, raw_payload = ? where id = ?",
+            (image_path, video_path, json.dumps(payload, ensure_ascii=False, indent=2), event_id),
         )
 
     if previous_image_path and previous_image_path != image_path:
         remove_relative_file(previous_image_path)
+    if previous_video_path and previous_video_path != video_path:
+        remove_relative_file(previous_video_path)
     return True
 
 
@@ -271,7 +285,7 @@ def remove_relative_file(relative_path):
 def delete_event(event_id):
     with db() as conn:
         row = conn.execute(
-            "select image_path, raw_path from events where id = ?",
+            "select image_path, video_path, raw_path from events where id = ?",
             (event_id,),
         ).fetchone()
         if not row:
@@ -279,17 +293,19 @@ def delete_event(event_id):
         conn.execute("delete from events where id = ?", (event_id,))
 
     remove_relative_file(row["image_path"])
+    remove_relative_file(row["video_path"])
     remove_relative_file(row["raw_path"])
     return True
 
 
 def clear_events():
     with db() as conn:
-        rows = conn.execute("select image_path, raw_path from events").fetchall()
+        rows = conn.execute("select image_path, video_path, raw_path from events").fetchall()
         conn.execute("delete from events")
 
     for row in rows:
         remove_relative_file(row["image_path"])
+        remove_relative_file(row["video_path"])
         remove_relative_file(row["raw_path"])
     return len(rows)
 
@@ -367,20 +383,87 @@ def capture_rtsp_frame(url, output_path):
     return data
 
 
+def capture_rtsp_clip(url, output_path, seconds):
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is not installed or ffmpeg_path is not configured.")
+
+    transcode_command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-rtsp_transport",
+        "tcp",
+        "-i",
+        url,
+        "-t",
+        str(seconds),
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        "-y",
+        str(output_path),
+    ]
+    result = subprocess.run(transcode_command, capture_output=True, text=True, timeout=max(20, int(seconds) + 15))
+    if result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
+        return output_path.read_bytes()
+
+    copy_command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-rtsp_transport",
+        "tcp",
+        "-i",
+        url,
+        "-t",
+        str(seconds),
+        "-an",
+        "-c:v",
+        "copy",
+        "-movflags",
+        "+faststart",
+        "-y",
+        str(output_path),
+    ]
+    copy_result = subprocess.run(copy_command, capture_output=True, text=True, timeout=max(20, int(seconds) + 15))
+    if copy_result.returncode != 0:
+        error_text = result.stderr or result.stdout or copy_result.stderr or copy_result.stdout or "ffmpeg clip capture failed"
+        raise RuntimeError(error_text.strip())
+    data = output_path.read_bytes()
+    if not data:
+        raise RuntimeError("ffmpeg clip output is empty.")
+    return data
+
+
 def save_rtsp_snapshot(event_id, camera_ip):
+    clip_seconds = float(load_config().get("clip_seconds") or DEFAULT_CLIP_SECONDS)
     errors = []
     for url in rtsp_urls(camera_ip):
-        filename = f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}_rtsp.jpg"
-        path = UPLOAD_DIR / filename
+        base_name = f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}_rtsp"
+        image_path_obj = UPLOAD_DIR / f"{base_name}.jpg"
+        video_path_obj = UPLOAD_DIR / f"{base_name}.mp4"
         try:
-            capture_rtsp_frame(url, path)
-            image_path = str(path.relative_to(BASE_DIR))
-            if not update_event_snapshot(event_id, image_path, "saved_rtsp"):
+            capture_rtsp_frame(url, image_path_obj)
+            capture_rtsp_clip(url, video_path_obj, clip_seconds)
+            image_path = str(image_path_obj.relative_to(BASE_DIR))
+            video_path = str(video_path_obj.relative_to(BASE_DIR))
+            if not update_event_media(event_id, image_path, video_path, "saved_rtsp"):
                 remove_relative_file(image_path)
-            print(f"RTSP frame capture saved for event {event_id}: {redact_url(url)}")
+                remove_relative_file(video_path)
+            print(f"RTSP media capture saved for event {event_id}: {redact_url(url)}")
             return True, ""
         except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
-            remove_relative_file(str(path.relative_to(BASE_DIR)))
+            remove_relative_file(str(image_path_obj.relative_to(BASE_DIR)))
+            remove_relative_file(str(video_path_obj.relative_to(BASE_DIR)))
             errors.append(f"{redact_url(url)} - {error}")
     return False, " | ".join(errors) if errors else "RTSP capture failed."
 
@@ -588,7 +671,7 @@ INDEX_HTML = """<!doctype html>
       <div class="viewer-head">
         <div>
           <h2>최근 이벤트</h2>
-          <p>5초마다 자동 갱신됩니다.</p>
+          <p>10초마다 자동 갱신됩니다.</p>
         </div>
         <button id="clearEventsBtn" class="danger" type="button">전체 제거</button>
       </div>
@@ -722,18 +805,42 @@ button.ghost-danger:hover {
 
 .image-stage {
   display: grid;
-  place-items: center;
+  place-items: stretch;
   min-height: 460px;
   background: #0f1419;
   overflow: hidden;
 }
 
-.image-stage img {
+.media-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 1px;
+  width: 100%;
+  min-height: 460px;
+  background: #1e2933;
+}
+
+.media-panel {
+  display: grid;
+  align-content: stretch;
+  min-width: 0;
+  background: #0f1419;
+}
+
+.media-panel span {
+  padding: 10px 12px;
+  color: #cbd5df;
+  font-size: 13px;
+}
+
+.image-stage img,
+.image-stage video {
   width: 100%;
   height: 100%;
   max-height: 620px;
   object-fit: contain;
   display: block;
+  background: #0f1419;
 }
 
 .empty {
@@ -815,6 +922,15 @@ textarea, input[type="file"] {
   background: #111820;
 }
 
+.event-card video {
+  width: 100%;
+  aspect-ratio: 16 / 10;
+  object-fit: cover;
+  display: block;
+  background: #111820;
+  border-top: 1px solid #e0e7ec;
+}
+
 .event-card .no-image {
   display: grid;
   place-items: center;
@@ -860,6 +976,11 @@ textarea, input[type="file"] {
   .image-stage {
     min-height: 320px;
   }
+
+  .media-grid {
+    grid-template-columns: 1fr;
+    min-height: 320px;
+  }
 }
 """
 
@@ -893,12 +1014,12 @@ function eventTitle(item) {
 function snapshotMessage(item) {
   const status = item.snapshot_status || {};
   if (status.status === "failed") {
-    return `3초 후 RTSP 캡처 실패: ${status.error || "RTSP 설정과 ffmpeg 설치를 확인하세요."}`;
+    return `3초 후 RTSP 이미지/영상 캡처 실패: ${status.error || "RTSP 설정과 ffmpeg 설치를 확인하세요."}`;
   }
   if (status.status === "capturing_rtsp") {
-    return "3초가 지나 RTSP 프레임을 캡처하는 중입니다.";
+    return "3초가 지나 RTSP 이미지와 영상을 캡처하는 중입니다.";
   }
-  return "사람 감지 이벤트를 받았습니다. 3초 후 RTSP 프레임을 캡처합니다.";
+  return "사람 감지 이벤트를 받았습니다. 3초 후 RTSP 이미지와 영상을 캡처합니다.";
 }
 
 function renderLatest(item) {
@@ -909,8 +1030,14 @@ function renderLatest(item) {
   }
 
   latestMeta.textContent = `${eventTitle(item)} · ${item.created_at}`;
-  if (item.image_url) {
-    imageStage.innerHTML = `<img src="${cacheBust(item.image_url)}" alt="최신 사람 감지 캡처">`;
+  if (item.image_url || item.video_url) {
+    const imagePanel = item.image_url
+      ? `<div class="media-panel"><span>캡처 이미지</span><img src="${cacheBust(item.image_url)}" alt="최신 사람 감지 캡처"></div>`
+      : '<div class="media-panel"><div class="empty">이미지 없음</div></div>';
+    const videoPanel = item.video_url
+      ? `<div class="media-panel"><span>감지 영상</span><video src="${cacheBust(item.video_url)}" controls muted playsinline></video></div>`
+      : '<div class="media-panel"><div class="empty">영상 없음</div></div>';
+    imageStage.innerHTML = `<div class="media-grid">${imagePanel}${videoPanel}</div>`;
   } else {
     imageStage.innerHTML = `<div class="empty">${snapshotMessage(item)}</div>`;
   }
@@ -926,9 +1053,13 @@ function renderEvents(items) {
     const image = item.image_url
       ? `<img src="${cacheBust(item.image_url)}" alt="감지 캡처">`
       : `<div class="no-image">${snapshotMessage(item)}</div>`;
+    const video = item.video_url
+      ? `<video src="${cacheBust(item.video_url)}" controls muted playsinline></video>`
+      : "";
     return `
       <article class="event-card">
         ${image}
+        ${video}
         <div class="event-body">
           <strong>${eventTitle(item)}</strong>
           <span>${item.created_at}</span>
@@ -998,7 +1129,7 @@ testForm.addEventListener("submit", async (event) => {
 });
 
 loadEvents();
-setInterval(loadEvents, 5000);
+setInterval(loadEvents, 30000);
 """
 
 
@@ -1109,6 +1240,7 @@ class Handler(BaseHTTPRequestHandler):
             camera_channel=camera_channel,
             event_type=event_type,
             image_path=image_path,
+            video_path="",
             raw_path=raw_path_for_db,
             raw_payload=raw_payload,
             content_type=content_type,

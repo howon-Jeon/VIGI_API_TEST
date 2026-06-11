@@ -35,7 +35,7 @@ http://192.168.10.233:8080/api/vigi/event
 ## 사람 감지 후 3초 뒤 RTSP 캡처
 
 이 앱은 사람 감지 이벤트가 들어와도 카메라가 첨부한 즉시 이미지는 사용하지 않습니다.
-대신 이벤트 수신 3초 후 RTSP stream에서 현재 프레임 1장을 JPEG로 저장합니다.
+대신 이벤트 수신 3초 후 RTSP stream에서 현재 프레임 1장을 JPEG로 저장하고, 짧은 MP4 영상도 함께 저장합니다.
 
 RTSP 캡처에는 `ffmpeg`가 필요합니다.
 
@@ -53,6 +53,7 @@ ffmpeg -version
 
 ```text
 vigi_event_web/uploads/events       JPEG 저장
+vigi_event_web/uploads/events       MP4 저장
 vigi_event_web/data/events.sqlite3  이벤트 DB
 ```
 
